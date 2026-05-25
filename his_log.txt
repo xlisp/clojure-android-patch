@@ -1,0 +1,61 @@
+我需要先查看这两个代码库，理解 `DalvikDynamicClassLoader` 在 1.7 中的实现，以及新版本的相关结构。让我先加载文件系统工具。现在让我看看 1.7 的 `DynamicClassLoader` 是如何与 `DalvikDynamicClassLoader` 集成的，以及关键的 hook 点。现在我明白了 1.7 的设计：`DynamicClassLoader` 是 `abstract`，强制子类（如 `DalvikDynamicClassLoader`）实现 `defineMissingClass`。让我看 1.7 里在哪些地方创建/选择 ClassLoader，特别是 `Compiler.java`：非常关键！1.7 的设计模式很清晰。我看到了所有关键点：
+
+1. `DynamicClassLoader` 是 abstract
+2. `JvmDynamicClassLoader` 是 JVM 上的子类
+3. `DalvikDynamicClassLoader` 是 Android 上的子类
+4. `RT.java` 在 baseLoader 时探测哪个可用
+5. `main.clj` 也做类似探测
+
+让我看 1.7 的关键代码片段：现在我有了 1.7 实现的完整图景。让我看看新版本的 Clojure 结构对比：关键差异已清晰：
+
+- **1.7（Android分支）**：`DynamicClassLoader` 是 `abstract`，把 `defineClass` 分成两步——`defineClass`（公共逻辑，缓存）+ 抽象的 `defineMissingClass`（子类实现具体字节码加载）。这样 `DalvikDynamicClassLoader` 只重写 `defineMissingClass` 就能把 JVM bytecode → DEX bytecode 转换。
+- **新版本**：`DynamicClassLoader` 是具体类，`defineClass(name, bytes, srcForm)` 内部直接调用 `ClassLoader.defineClass(name, bytes, 0, bytes.length)`，这在 Dalvik/ART 上**无法工作**，因为 Android 运行时不接受 JVM bytecode。
+
+让我快速看一下新版本的 RT 和 main.clj 以及 Clojure 版本：好。现在我对比清楚了。看看 main.clj 在新版的对比也确认下，再确认下当前目录里是否有合适位置可以放新文件：新版本 `main.clj` 和 `core.clj` 里也都完全没有 Dalvik 痕迹（grep 没匹配到任何东西）。让我看一下新版本里有关的 main.clj 和 core.clj 片段位置，以便修补：完美。现在还需要确认 1.7 里 core.clj 关于 data_readers 的处理（这是 DalvikDynamicClassLoader 提供 `getDataReadersStream()` 的原因），用来打 patch：好。现在让我看新版本 core.clj 同样的 load-data-readers 部分：好，所有信息齐备。现在我对整个改造方案有完整理解了。让我把方案和补丁文件都准备好。
+
+我先创建工作目录、生成所有补丁文件：现在创建第一个核心文件 —— 改造后的 `DynamicClassLoader.java`（保持非抽象 + 可被子类重写）：现在创建 `DalvikDynamicClassLoader.java`，按 1.7 的思路适配（注意 Android 现代版本要用 `dx`/`d8` 库；这里我提供两种实现，先用 `dx`，因为 1.7 用的就是这个）：现在创建对 `RT.java` 的修改片段 —— 让 `makeClassLoader()` 在 Dalvik 上自动选择 `DalvikDynamicClassLoader`：现在创建对 `core.clj` 中 `load-data-readers` 的补丁：再生成 build 配置变更说明（Maven `pom.xml` 需要把 Android 相关源排除在主 JAR 之外，避免普通 JVM 构建时找不到 `android.*` 类）：最后再补一个用 `InMemoryDexClassLoader`（更现代的 Android 8.0+ 方案）的 `DalvikDynamicClassLoader` 变体，作为更推荐的版本：咦，文件没有持久化。可能 `create_file` 工具只在容器内可见。让我用 bash 写到那个目录：好，filesystem:execute_command 跑在用户机器上（macOS），但 create_file 跑在容器里。让我直接用 bash 写入用户机器的目录：文件已经写到用户磁盘了。继续写剩下的文件：所有文件已经写入 `/Users/xlisp/CljPro/clojure-android-patch/`。让我用一个图说明整个方案的设计:## 完成 ✅
+
+我已经把完整方案准备好了，输出到 `/Users/xlisp/CljPro/clojure-android-patch/`：
+
+```
+clojure-android-patch/
+├── DynamicClassLoader.java              ← 替换主仓库的同名文件
+├── DalvikDynamicClassLoader.java        ← Android 适配 (dx 版本，从 1.7 移植)
+├── DalvikDynamicClassLoader_modern_d8.java  ← Android 适配 (d8 版本，推荐！)
+├── RT.patch.md                          ← 改 RT.java 的步骤
+├── core_clj.patch.md                    ← 改 core.clj 的步骤
+└── README.md                            ← 总体方案 + 集成指南
+```
+
+### 方案核心 —— "钩子模式" 而非 1.7 的 "抽象继承"
+
+**1.7 的根本问题**：把 `DynamicClassLoader` 改成 `abstract`，导致所有 `new DynamicClassLoader(...)` 的下游代码（Leiningen、boot、tools.deps、shadow-cljs 等）都得改。这是 1.7 安卓分支无法合并回主线的根本原因。
+
+**新方案的关键**：
+1. **`DynamicClassLoader` 保持具体类**，但把 bytecode → class 这一步拆成可重写方法 `defineMissingClass`，默认实现 = `defineClass(name, bytes, 0, bytes.length)`。**JVM 用户零影响**。
+2. **`getDataReadersStream()` 同样加成钩子**，默认返回 `null`，让 core.clj 的 `load-data-readers` 优先问 ClassLoader、再 fallback 到 classpath 枚举。
+3. **`RT.makeClassLoader()` 用反射**（`Class.forName("clojure.lang.DalvikDynamicClassLoader")`）按 `java.vm.name` 选择实现 —— 主 jar 不依赖 `android.jar`/`dx`，纯 JVM 构建照常通过。
+4. **`DalvikDynamicClassLoader` 单独打包** 成 supplementary jar，重写两个钩子。提供两版：dx（兼容旧 Android）和 d8 + `InMemoryDexClassLoader`（API 26+，免落盘，**推荐**）。
+
+### 落地步骤摘要
+
+```bash
+# A. 改 Clojure 主仓库 (3 处)
+cp /Users/xlisp/CljPro/clojure-android-patch/DynamicClassLoader.java \
+   /Users/xlisp/CljPro/clojure/src/jvm/clojure/lang/DynamicClassLoader.java
+# 按 RT.patch.md 改 RT.java
+# 按 core_clj.patch.md 改 core.clj
+cd /Users/xlisp/CljPro/clojure && mvn test  # 全绿 → JVM 端零影响
+
+# B. Android supplementary jar
+# 把 DalvikDynamicClassLoader_modern_d8.java 放进 Android Library 模块
+# build.gradle: implementation 'com.android.tools:r8:8.2.47'
+
+# C. Android Application.onCreate() 里调:
+#    DalvikDynamicClassLoader.setContext(this);
+#    Thread.currentThread().setContextClassLoader(
+#        new DalvikDynamicClassLoader(getClassLoader()));
+```
+
+详细推导、API 注意事项（`DexFile.loadDex` 已在 O+ 弃用、`InMemoryDexClassLoader` 替代等）、以及为什么用反射而非 import 都写在 `README.md` 里了，直接打开看就行。
+
