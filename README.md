@@ -1,5 +1,7 @@
 # 让新版 Clojure (1.13+) 支持 Android / Dalvik 的方案
 
+![](./Dalvik.png)
+
 ## 1. 问题诊断
 
 对比 `/Users/xlisp/CljPro/clojure-android-1-7`（1.7 Android 分支）和 `/Users/xlisp/CljPro/clojure`（1.13.0-master-SNAPSHOT），根因在 4 处：
